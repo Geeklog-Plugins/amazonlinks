@@ -21,22 +21,45 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read plugin version
-        id: version
+      - name: Read plugin metadata
+        id: metadata
         shell: bash
         run: |
           VERSION="$(sed -n 's:.*<pi_version>\(.*\)</pi_version>.*:\1:p' plugin.xml | head -n 1)"
+          GL_VERSION="$(sed -n 's:.*<pi_gl_version>\(.*\)</pi_gl_version>.*:\1:p' plugin.xml | head -n 1)"
+
           if [ -z "$VERSION" ]; then
             echo "Unable to read pi_version from plugin.xml" >&2
             exit 1
           fi
+
+          if [ -z "$GL_VERSION" ]; then
+            echo "Unable to read pi_gl_version from plugin.xml" >&2
+            exit 1
+          fi
+
+          ARCHIVE="amazonlinks_${VERSION}_${GL_VERSION}.zip"
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Building AmazonLinks $VERSION"
+          echo "gl_version=$GL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "Building AmazonLinks $VERSION for Geeklog $GL_VERSION"
+
+      - name: Validate PHP syntax
+        shell: bash
+        run: |
+          find . \
+            -type f \
+            -name '*.php' \
+            -not -path './dist/*' \
+            -not -path './build/*' \
+            -print0 \
+          | xargs -0 -n1 php -l
 
       - name: Build installable ZIP
         shell: bash
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          ARCHIVE="${{ steps.metadata.outputs.archive }}"
           rm -rf build
           mkdir -p build/amazonlinks dist
 
@@ -46,34 +69,39 @@ jobs:
             --exclude='dist/' \
             --exclude='build/'
 
-          rm -f "dist/amazonlinks-${VERSION}.zip"
+          rm -f "dist/$ARCHIVE"
           (
             cd build
-            zip -r -q "../dist/amazonlinks-${VERSION}.zip" amazonlinks
+            zip -r -q "../dist/$ARCHIVE" amazonlinks
           )
 
-          echo "Created dist/amazonlinks-${VERSION}.zip"
-          unzip -l "dist/amazonlinks-${VERSION}.zip"
+          echo "Created dist/$ARCHIVE"
+          unzip -l "dist/$ARCHIVE"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: amazonlinks-${{ steps.version.outputs.version }}
-          path: dist/amazonlinks-${{ steps.version.outputs.version }}.zip
+          name: amazonlinks-${{ steps.metadata.outputs.version }}-geeklog-${{ steps.metadata.outputs.gl_version }}
+          path: dist/${{ steps.metadata.outputs.archive }}
           if-no-files-found: error
 
       - name: Commit updated archive
         shell: bash
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
+          ARCHIVE="${{ steps.metadata.outputs.archive }}"
+          VERSION="${{ steps.metadata.outputs.version }}"
+          GL_VERSION="${{ steps.metadata.outputs.gl_version }}"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "dist/amazonlinks-${VERSION}.zip"
+
+          git rm -f --ignore-unmatch "dist/amazonlinks-${VERSION}.zip"
+          git add "dist/$ARCHIVE"
 
           if git diff --cached --quiet; then
             echo "Archive unchanged; nothing to commit."
             exit 0
           fi
 
-          git commit -m "Build AmazonLinks ${VERSION} distributable [skip ci]"
+          git commit -m "Build AmazonLinks ${VERSION} for Geeklog ${GL_VERSION} distributable [skip ci]"
           git push origin "HEAD:${GITHUB_REF_NAME}"
