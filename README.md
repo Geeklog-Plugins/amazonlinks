@@ -64,11 +64,19 @@ Version 1.0 used:
 
     {path_data}/amazonlinks_config.php
 
-Version 1.1 deliberately does **not** include or execute that writable PHP file.
+The 1.0 -> 1.1 upgrade automatically migrates the trusted legacy configuration into the Geeklog Configuration API and private JSON rule storage. The affiliate tag, block title, maximum link count and contextual keyword rules are preserved. When possible, the Amazon marketplace is also detected from the existing rule URLs.
 
-If it is still present, the administration page displays a warning. Recreate the required rules in the new administrator interface, then archive or delete the legacy PHP file manually after verifying the migration.
+The migration runs only during the explicit Geeklog plugin upgrade. Merely deploying the 1.1 files does not migrate a site that is still persisted as AmazonLinks 1.0. This is important for installations where several Geeklog sites share the same plugin files.
 
-The file is not removed automatically because it may contain user-maintained data.
+Until a site completes its own upgrade, AmazonLinks 1.1 keeps a read-only compatibility path for its legacy `amazonlinks_config.php`, so the existing links continue to work without creating new 1.1 rule state prematurely.
+
+After a successful migration, the old file is renamed to:
+
+    amazonlinks_config.php.migrated-1.0.0.bak
+
+If rule conversion fails, the plugin version is not advanced to 1.1.0, the legacy file is preserved, and the next explicit upgrade can retry the migration safely.
+
+Review the migrated configuration and rules after upgrading. Keep the backup until the site has been verified, then archive or remove it manually when it is no longer needed.
 
 ## Display modes
 
@@ -164,13 +172,15 @@ The private `data-amazonlinks` directory is intentionally **not deleted automati
 
 AmazonLinks 1.1:
 
-- does not execute mutable configuration files;
+- does not execute mutable configuration files during normal frontend requests;
 - accepts only `http` and `https` direct rule URLs;
 - escapes generated HTML attributes and labels;
 - uses Geeklog permissions for administration;
 - uses Geeklog CSRF tokens when rules are saved;
 - writes JSON through a temporary file followed by an atomic rename;
 - has no outbound reporting or telemetry.
+
+The legacy PHP configuration is read only for 1.0 compatibility and once during the explicit 1.0 -> 1.1 migration.
 
 ## License
 
