@@ -1,0 +1,118 @@
+name: Build distributable archive
+
+on:
+  push:
+    branches:
+      - modernize-1.1.0
+    paths-ignore:
+      - 'dist/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-dist:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read plugin metadata
+        id: metadata
+        shell: bash
+        run: |
+          VERSION="$(php -r '$p = include "autoinstall.php"; if (function_exists("plugin_autoinstall_amazonlinks")) { $i = plugin_autoinstall_amazonlinks("amazonlinks"); echo isset($i["info"]["pi_version"]) ? $i["info"]["pi_version"] : ""; }' 2>/dev/null)"
+          GL_VERSION="$(php -r '$p = include "autoinstall.php"; if (function_exists("plugin_autoinstall_amazonlinks")) { $i = plugin_autoinstall_amazonlinks("amazonlinks"); echo isset($i["info"]["pi_gl_version"]) ? $i["info"]["pi_gl_version"] : ""; }' 2>/dev/null)"
+
+          if [ -z "$VERSION" ]; then
+            echo "Unable to read pi_version from autoinstall.php" >&2
+            exit 1
+          fi
+
+          if [ -z "$GL_VERSION" ]; then
+            echo "Unable to read pi_gl_version from autoinstall.php" >&2
+            exit 1
+          fi
+
+          ARCHIVE="amazonlinks_${VERSION}_${GL_VERSION}.zip"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "gl_version=$GL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "Building AmazonLinks $VERSION for Geeklog $GL_VERSION"
+
+      - name: Validate plugin manifest
+        shell: bash
+        run: |
+          php -r '
+          $m = json_decode(file_get_contents("plugin.json"), true);
+          if (!is_array($m) || (int)($m["schema"] ?? 0) !== 1 || ($m["id"] ?? "") !== "amazonlinks") {
+              fwrite(STDERR, "Invalid plugin.json\n");
+              exit(1);
+          }
+          '
+
+      - name: Validate PHP syntax
+        shell: bash
+        run: |
+          find . \
+            -type f \
+            -name '*.php' \
+            -not -path './dist/*' \
+            -not -path './build/*' \
+            -print0 \
+          | xargs -0 -n1 php -l
+
+      - name: Build installable ZIP
+        shell: bash
+        run: |
+          ARCHIVE="${{ steps.metadata.outputs.archive }}"
+          rm -rf build
+          mkdir -p build/amazonlinks dist
+
+          rsync -a ./ build/amazonlinks/ \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='dist/' \
+            --exclude='build/'
+
+          rm -f "dist/$ARCHIVE"
+          (
+            cd build
+            zip -r -q "../dist/$ARCHIVE" amazonlinks
+          )
+
+          echo "Created dist/$ARCHIVE"
+          unzip -l "dist/$ARCHIVE"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amazonlinks-${{ steps.metadata.outputs.version }}-geeklog-${{ steps.metadata.outputs.gl_version }}
+          path: dist/${{ steps.metadata.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Commit updated archive
+        shell: bash
+        run: |
+          ARCHIVE="${{ steps.metadata.outputs.archive }}"
+          VERSION="${{ steps.metadata.outputs.version }}"
+          GL_VERSION="${{ steps.metadata.outputs.gl_version }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git rm -f --ignore-unmatch "dist/amazonlinks-${VERSION}.zip"
+          git add "dist/$ARCHIVE"
+
+          if git diff --cached --quiet; then
+            echo "Archive unchanged; nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "Build AmazonLinks ${VERSION} for Geeklog ${GL_VERSION} distributable [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

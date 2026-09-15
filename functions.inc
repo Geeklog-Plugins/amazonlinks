@@ -1,187 +1,808 @@
 <?php
 
-/* Reminder: always indent with 4 spaces (no tabs). */
-// +---------------------------------------------------------------------------+
-// | AmazonLinks Plugin 1.0                                                    |
-// +---------------------------------------------------------------------------+
-// | functions.php                                                             |
-// |                                                                           |
-// | This file implements the Geeklog Plugin API functions and core logic      |
-// | used by the AmazonLinks plugin. It handles keyword detection within       |
-// | articles and automatic display of affiliate link blocks.                  |
-// +---------------------------------------------------------------------------+
-// | Copyright (C) 2025 by the following authors:                              |
-// |                                                                           |
-// | Authors: ::Ben - ben AT geeklog DOT fr                                    |
-// +---------------------------------------------------------------------------+
-// |                                                                           |
-// | This program is free software; you can redistribute it and/or             |
-// | modify it under the terms of the GNU General Public License               |
-// | as published by the Free Software Foundation; either version 2            |
-// | of the License, or (at your option) any later version.                    |
-// |                                                                           |
-// | This program is distributed in the hope that it will be useful,           |
-// | but WITHOUT ANY WARRANTY; without even the implied warranty of            |
-// | MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the             |
-// | GNU General Public License for more details.                              |
-// |                                                                           |
-// | You should have received a copy of the GNU General Public License         |
-// | along with this program; if not, write to the Free Software Foundation,   |
-// | Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.           |
-// |                                                                           |
-// +---------------------------------------------------------------------------+
+/* AmazonLinks Plugin 1.1.0 */
 
-// functions.inc – AmazonLinks Plugin
-
-if (strpos(strtolower($_SERVER['PHP_SELF']), 'functions.inc') !== false) {
+if (stripos($_SERVER['PHP_SELF'], basename(__FILE__)) !== false) {
     die('This file can not be used on its own.');
 }
 
-/**
- * Hook: Injects Amazon affiliate links as styled buttons below articles
- */
-function plugin_templateSetVars_amazonlinks($templatename, $template)
+global $_CONF, $_AMAZONLINKS_CONF;
+
+$amazonlinksPluginPath = $_CONF['path'] . 'plugins/amazonlinks/';
+
+require_once $amazonlinksPluginPath . 'lib/storage.php';
+
+$langfile = $amazonlinksPluginPath . 'language/' . $_CONF['language'] . '.php';
+if (file_exists($langfile)) {
+    require_once $langfile;
+} else {
+    require_once $amazonlinksPluginPath . 'language/english.php';
+}
+
+if (!isset($_AMAZONLINKS_CONF) || !is_array($_AMAZONLINKS_CONF)) {
+    $_AMAZONLINKS_CONF = AMAZONLINKS_loadConfig();
+}
+
+function AMAZONLINKS_loadConfig()
 {
-    global $_CONF;
+    $defaults = array(
+        'enabled'       => 1,
+        'title'         => 'Recommended resources on Amazon',
+        'marketplace'   => 'www.amazon.com',
+        'affiliate_tag' => '',
+        'max_links'     => 5,
+        'display_mode'  => 'automatic',
+        'button_color'  => 'theme',
+        'new_window'    => 1,
+        'load_css'      => 1,
+        'autotag_css'   => 1
+    );
 
-    // Apply only to story templates
-    if (!in_array($templatename, array('storytext', 'featuredstorytext', 'storybodytext'))) {
+    if (!class_exists('config')) {
+        return $defaults;
+    }
+
+    $c = config::get_instance();
+
+    if (method_exists($c, 'group_exists') && !$c->group_exists('amazonlinks')) {
+        return $defaults;
+    }
+
+    $stored = $c->get_config('amazonlinks');
+
+    if (!is_array($stored) || empty($stored)) {
+        return $defaults;
+    }
+
+    return array_merge($defaults, $stored);
+}
+
+/**
+ * AmazonLinks changes the rendered article HTML, so cached article instances
+ * created before an upgrade or configuration/rule change must be rebuilt.
+ * Geeklog's CACHE_remove_instance() accepts a prefix and removes every matching
+ * instance, making article__ safe for all cached article variants.
+ */
+function AMAZONLINKS_clearArticleCache()
+{
+    if (function_exists('CACHE_remove_instance')) {
+        CACHE_remove_instance('article__');
+    }
+}
+
+/**
+ * Keep cached articles synchronized with the native Geeklog configuration.
+ * This hook is available in Geeklog 2.1.1 and later.
+ */
+function plugin_configchange_amazonlinks($group, $changes = array())
+{
+    global $_AMAZONLINKS_CONF;
+
+    if ($group !== 'amazonlinks') {
         return;
     }
 
-    $configFile = $_CONF['path_data'] . 'amazonlinks_config.php';
-    if (!file_exists($configFile)) {
-        return;
+    $_AMAZONLINKS_CONF = AMAZONLINKS_loadConfig();
+    AMAZONLINKS_clearArticleCache();
+}
+
+function AMAZONLINKS_isFullStoryDisplay($displayType)
+{
+    $displayType = trim((string) $displayType);
+
+    if ($displayType !== '') {
+        return $displayType === 'n';
     }
 
-    include $configFile;
-    if (empty($AMAZONLINKS_CONF['keywords'])) {
-        return;
+    $script = '';
+    if (!empty($_SERVER['SCRIPT_NAME'])) {
+        $script = basename((string) $_SERVER['SCRIPT_NAME']);
+    } elseif (!empty($_SERVER['PHP_SELF'])) {
+        $script = basename((string) $_SERVER['PHP_SELF']);
     }
 
-    $title    = isset($AMAZONLINKS_CONF['title']) ? $AMAZONLINKS_CONF['title'] : '🔗 Recommended Resources';
-    $tag      = isset($AMAZONLINKS_CONF['tag']) ? trim($AMAZONLINKS_CONF['tag']) : '';
-    $max      = isset($AMAZONLINKS_CONF['max_links']) ? intval($AMAZONLINKS_CONF['max_links']) : 5;
-    $keywords = $AMAZONLINKS_CONF['keywords'];
+    return $script === 'article.php';
+}
 
-    // Extract article content
-    $content = strtolower(strip_tags($template->get_var('story_bodytext_only')));
-    if (empty($content)) {
-        return;
+function AMAZONLINKS_marketplaces()
+{
+    return array(
+        'www.amazon.com',
+        'www.amazon.fr',
+        'www.amazon.de',
+        'www.amazon.it',
+        'www.amazon.es',
+        'www.amazon.co.uk',
+        'www.amazon.ca',
+        'www.amazon.com.au',
+        'www.amazon.co.jp',
+        'www.amazon.in'
+    );
+}
+
+function AMAZONLINKS_getMarketplace()
+{
+    global $_AMAZONLINKS_CONF;
+
+    $marketplace = isset($_AMAZONLINKS_CONF['marketplace'])
+        ? strtolower(trim($_AMAZONLINKS_CONF['marketplace']))
+        : 'www.amazon.com';
+
+    if (!in_array($marketplace, AMAZONLINKS_marketplaces(), true)) {
+        $marketplace = 'www.amazon.com';
     }
 
-    // Detect keywords in the article text
-    $found = array();
-    foreach ($keywords as $word => $data) {
-        $url   = is_array($data) ? $data['url'] : $data;
-        $label = is_array($data) && !empty($data['label']) ? $data['label'] : ucfirst($word);
+    return $marketplace;
+}
 
-        if (stripos($content, $word) !== false) {
-            // Add affiliate tag if missing
-            if ($tag && strpos($url, 'tag=') === false) {
-                $sep = (strpos($url, '?') !== false) ? '&' : '?';
-                $url .= $sep . 'tag=' . urlencode($tag);
-            }
-            $found[$label] = $url;
+function AMAZONLINKS_buildSearchUrl($query)
+{
+    $url = 'https://' . AMAZONLINKS_getMarketplace() . '/s?k=' . rawurlencode($query);
+    return AMAZONLINKS_addAffiliateTag($url);
+}
+
+function AMAZONLINKS_buildAsinUrl($asin)
+{
+    $asin = preg_replace('/[^A-Za-z0-9]/', '', (string) $asin);
+    if ($asin === '') {
+        return '';
+    }
+
+    $url = 'https://' . AMAZONLINKS_getMarketplace() . '/dp/' . rawurlencode($asin);
+    return AMAZONLINKS_addAffiliateTag($url);
+}
+
+function AMAZONLINKS_addAffiliateTag($url)
+{
+    global $_AMAZONLINKS_CONF;
+
+    if (!AMAZONLINKS_isSafeHttpUrl($url)) {
+        return '';
+    }
+
+    $tag = isset($_AMAZONLINKS_CONF['affiliate_tag'])
+        ? trim((string) $_AMAZONLINKS_CONF['affiliate_tag'])
+        : '';
+
+    if ($tag === '') {
+        return $url;
+    }
+
+    $parts = parse_url($url);
+    if (!is_array($parts)) {
+        return '';
+    }
+
+    $query = array();
+    if (!empty($parts['query'])) {
+        parse_str($parts['query'], $query);
+    }
+
+    foreach (array_keys($query) as $key) {
+        if (strtolower((string) $key) === 'tag') {
+            unset($query[$key]);
         }
     }
 
+    $query['tag'] = $tag;
+
+    $rebuilt = '';
+    if (!empty($parts['scheme'])) {
+        $rebuilt .= $parts['scheme'] . '://';
+    }
+    if (!empty($parts['user'])) {
+        $rebuilt .= $parts['user'];
+        if (!empty($parts['pass'])) {
+            $rebuilt .= ':' . $parts['pass'];
+        }
+        $rebuilt .= '@';
+    }
+    if (!empty($parts['host'])) {
+        $rebuilt .= $parts['host'];
+    }
+    if (!empty($parts['port'])) {
+        $rebuilt .= ':' . $parts['port'];
+    }
+    if (!empty($parts['path'])) {
+        $rebuilt .= $parts['path'];
+    }
+
+    $rebuilt .= '?' . http_build_query($query, '', '&');
+
+    if (!empty($parts['fragment'])) {
+        $rebuilt .= '#' . $parts['fragment'];
+    }
+
+    return AMAZONLINKS_isSafeHttpUrl($rebuilt) ? $rebuilt : '';
+}
+
+function AMAZONLINKS_ruleMatches($content, $keyword, $mode)
+{
+    $keyword = trim((string) $keyword);
+    if ($keyword === '') {
+        return false;
+    }
+
+    if ($mode === 'substring') {
+        return stripos($content, $keyword) !== false;
+    }
+
+    if ($mode === 'word') {
+        $pattern = '/(?<![\\pL\\pN_])' . preg_quote($keyword, '/') . '(?![\\pL\\pN_])/iu';
+        return preg_match($pattern, $content) === 1;
+    }
+
+    $pattern = '/' . preg_quote($keyword, '/') . '/iu';
+    return preg_match($pattern, $content) === 1;
+}
+
+function AMAZONLINKS_storyTopics($template)
+{
+    global $_TABLES;
+
+    $topics = array();
+    $sid = '';
+
+    foreach (array('story_id', 'sid') as $var) {
+        $value = $template->get_var($var);
+        if (!empty($value)) {
+            $sid = (string) $value;
+            break;
+        }
+    }
+
+    if ($sid === '' || empty($_TABLES['topic_assignments'])) {
+        return $topics;
+    }
+
+    $result = DB_query(
+        "SELECT tid FROM {$_TABLES['topic_assignments']} "
+        . "WHERE type = 'article' AND id = '" . DB_escapeString($sid) . "'"
+    );
+
+    while ($row = DB_fetchArray($result)) {
+        if (isset($row['tid'])) {
+            $topics[] = (string) $row['tid'];
+        }
+    }
+
+    return array_unique($topics);
+}
+
+function AMAZONLINKS_ruleTopicMatches($ruleTopic, $storyTopics)
+{
+    $ruleTopic = trim((string) $ruleTopic);
+
+    if ($ruleTopic === '' || strtolower($ruleTopic) === 'all') {
+        return true;
+    }
+
+    return in_array($ruleTopic, $storyTopics, true);
+}
+
+function AMAZONLINKS_ruleUrl($rule)
+{
+    if ($rule['type'] === 'search') {
+        return AMAZONLINKS_buildSearchUrl($rule['target']);
+    }
+
+    if (!AMAZONLINKS_isSafeHttpUrl($rule['target'])) {
+        return '';
+    }
+
+    return AMAZONLINKS_addAffiliateTag($rule['target']);
+}
+
+function AMAZONLINKS_renderLink($label, $url, $className)
+{
+    global $_AMAZONLINKS_CONF;
+
+    if (!AMAZONLINKS_isSafeHttpUrl($url)) {
+        return '';
+    }
+
+    $attrs = '';
+    $className = trim((string) $className);
+    if ($className !== '') {
+        $attrs .= ' class="' . htmlspecialchars($className, ENT_QUOTES, 'UTF-8') . '"';
+    }
+    $attrs .= ' href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '"'
+        . ' rel="nofollow sponsored noopener"';
+
+    if (!empty($_AMAZONLINKS_CONF['new_window'])) {
+        $attrs .= ' target="_blank"';
+    }
+
+    return '<a' . $attrs . '>'
+        . htmlspecialchars($label, ENT_QUOTES, 'UTF-8')
+        . '</a>';
+}
+
+function AMAZONLINKS_displayMode()
+{
+    global $_AMAZONLINKS_CONF;
+
+    $mode = isset($_AMAZONLINKS_CONF['display_mode'])
+        ? strtolower(trim((string) $_AMAZONLINKS_CONF['display_mode']))
+        : 'automatic';
+
+    if (!in_array($mode, array('automatic', 'template', 'disabled'), true)) {
+        $mode = 'automatic';
+    }
+
+    return $mode;
+}
+
+function AMAZONLINKS_buttonColor()
+{
+    global $_AMAZONLINKS_CONF;
+
+    $allowed = array('theme', 'blue', 'green', 'orange', 'red', 'dark', 'gray');
+    $color = isset($_AMAZONLINKS_CONF['button_color'])
+        ? strtolower(trim((string) $_AMAZONLINKS_CONF['button_color']))
+        : 'theme';
+
+    if (!in_array($color, $allowed, true)) {
+        $color = 'theme';
+    }
+
+    return $color;
+}
+
+function AMAZONLINKS_buildContextualBlock($content, $storyTopics)
+{
+    global $_AMAZONLINKS_CONF, $LANG_AMAZONLINKS;
+
+    if (empty($_AMAZONLINKS_CONF['enabled'])) {
+        return '';
+    }
+
+    $content = html_entity_decode(strip_tags((string) $content), ENT_QUOTES, 'UTF-8');
+    if (trim($content) === '') {
+        return '';
+    }
+
+    $rules = AMAZONLINKS_loadRules();
+    if (empty($rules)) {
+        return '';
+    }
+
+    $found = array();
+    $seenUrls = array();
+
+    foreach ($rules as $rule) {
+        if (empty($rule['enabled'])) {
+            continue;
+        }
+        if (!AMAZONLINKS_ruleTopicMatches($rule['topic'], $storyTopics)) {
+            continue;
+        }
+        if (!AMAZONLINKS_ruleMatches($content, $rule['keyword'], $rule['match'])) {
+            continue;
+        }
+
+        $url = AMAZONLINKS_ruleUrl($rule);
+        if ($url === '' || isset($seenUrls[$url])) {
+            continue;
+        }
+
+        $seenUrls[$url] = true;
+        $found[] = array('label' => $rule['label'], 'url' => $url);
+    }
+
+    $max = isset($_AMAZONLINKS_CONF['max_links']) ? (int) $_AMAZONLINKS_CONF['max_links'] : 5;
+    if ($max < 1) {
+        $max = 1;
+    } elseif ($max > 20) {
+        $max = 20;
+    }
+
+    if (count($found) > $max) {
+        $found = array_slice($found, 0, $max);
+    }
+
     if (empty($found)) {
+        return '';
+    }
+
+    $title = isset($_AMAZONLINKS_CONF['title'])
+        ? trim((string) $_AMAZONLINKS_CONF['title'])
+        : '';
+
+    $legacyTitles = array(
+        '',
+        'Recommended resources',
+        'Recommended Resources',
+        'Recommended resources on Amazon',
+        'Ressources recommandées',
+        'Ressources Recommandées'
+    );
+
+    if (in_array($title, $legacyTitles, true)) {
+        $title = isset($LANG_AMAZONLINKS['default_block_title'])
+            ? $LANG_AMAZONLINKS['default_block_title']
+            : 'Recommended resources on Amazon';
+    }
+
+    $affiliateTag = isset($_AMAZONLINKS_CONF['affiliate_tag'])
+        ? trim((string) $_AMAZONLINKS_CONF['affiliate_tag'])
+        : '';
+    $disclosure = '';
+    if ($affiliateTag !== '' && isset($LANG_AMAZONLINKS['affiliate_disclosure'])) {
+        $disclosure = trim((string) $LANG_AMAZONLINKS['affiliate_disclosure']);
+    }
+
+    $colorClass = ' amazonlinks-color-' . AMAZONLINKS_buttonColor();
+
+    $html = '<aside class="amazonlinks-block' . $colorClass . '" aria-label="'
+        . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '">';
+
+    if ($title !== '') {
+        $html .= '<div class="amazonlinks-title">'
+            . htmlspecialchars($title, ENT_QUOTES, 'UTF-8')
+            . '</div>';
+    }
+
+    $html .= '<div class="amazonlinks-list">';
+
+    foreach ($found as $item) {
+        $html .= AMAZONLINKS_renderLink($item['label'], $item['url'], 'amazonlinks-link');
+    }
+
+    $html .= '</div>';
+
+    if ($disclosure !== '') {
+        $html .= '<div class="amazonlinks-disclosure">'
+            . htmlspecialchars($disclosure, ENT_QUOTES, 'UTF-8')
+            . '</div>';
+    }
+
+    $html .= '</aside>';
+
+    return $html;
+}
+
+/**
+ * Append the automatic block to the visible story variables used by current
+ * Geeklog themes. The caller decides whether the active Geeklog rendering path
+ * can actually use this direct injection.
+ */
+function AMAZONLINKS_injectVisibleStoryContent($template, $html)
+{
+    if ($html === '') {
         return;
     }
 
-    // Limit the number of displayed links
-    if (count($found) > $max) {
-        $found = array_slice($found, 0, $max, true);
+    foreach (array('story_text_no_br', 'story_introtext') as $var) {
+        $value = (string) $template->get_var($var);
+        if ($value !== '' && strpos($value, 'amazonlinks-block') === false) {
+            $template->set_var($var, $value . $html);
+        }
+    }
+}
+
+function plugin_templateSetVars_amazonlinks($templatename, $template)
+{
+    global $_AMAZONLINKS_CONF;
+
+    $storyTemplates = array(
+        'storytext',
+        'featuredstorytext',
+        'archivestorytext',
+        'storybodytext',
+        'featuredstorybodytext',
+        'archivestorybodytext',
+        'article',
+        'featuredarticle',
+        'archivearticle'
+    );
+
+    if (!in_array($templatename, $storyTemplates, true)) {
+        return;
     }
 
-    // Generate HTML output
-    $html = '<style>
-    .amazonlinks-block {
-        margin-top: 2em;
-        padding: 1em 0em;
-        border-top: 1px solid #ddd;
-    }
-    .amazonlinks-title {
-        font-weight: bold;
-        margin-bottom: 0.6em;
-    }
-    .amazonlinks-list {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 0.6em;
-    }
-    .amazonlinks-btn {
-        background-color: #0A66C2; /* LinkedIn blue */
-        color: #fff; /* white text by default */
-        text-decoration: none;
-        padding: 0.6em 1.3em;
-        border-radius: 6px;
-        font-size: 0.9em;
-        font-weight: 500;
-        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        transition: all 0.2s ease-in-out;
-    }
-    .amazonlinks-btn:hover {
-        background-color: #007BFF; /* lighter blue on hover */
-        color: #fff !important;
-        text-decoration: none;
-        transform: translateY(-2px);
-        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-    }
-    .amazonlinks-btn:visited {
-        color: #fff;
-    }
-    </style>';
+    /*
+     * Shared-files compatibility for sites still persisted as 1.0: reproduce
+     * the historical selection path exactly enough to avoid changing which
+     * articles receive links merely because 1.1 files were uploaded.
+     */
+    if (!empty($_AMAZONLINKS_CONF['legacy_runtime'])) {
+        $content = strtolower(strip_tags((string) $template->get_var('story_bodytext_only')));
+        if ($content === '') {
+            return;
+        }
 
-    $html .= '<div class="amazonlinks-block">';
-    $html .= '<div class="amazonlinks-title">' . htmlspecialchars($title) . '</div>';
-    $html .= '<div class="amazonlinks-list">';
-
-    foreach ($found as $label => $url) {
-        $html .= '<a class="amazonlinks-btn" href="' . htmlspecialchars($url) . '" target="_blank" rel="nofollow">'
-            . htmlspecialchars($label) . '</a>';
+        $html = AMAZONLINKS_buildContextualBlock($content, array());
+        if ($html !== '') {
+            $template->set_var('amazonlinks', $html);
+        }
+        return;
     }
 
-    $html .= '</div></div>';
+    $mode = AMAZONLINKS_displayMode();
 
+    if ($mode === 'disabled') {
+        return;
+    }
+
+    $visibleText = (string) $template->get_var('story_text_no_br');
+    $title = (string) $template->get_var('story_title');
+    $intro = (string) $template->get_var('story_introtext_only');
+    $body = (string) $template->get_var('story_bodytext_only');
+
+    if ($intro === '') {
+        $intro = (string) $template->get_var('story_introtext');
+    }
+
+    $content = trim($visibleText);
+    if ($content === '') {
+        $content = trim($title . ' ' . $intro . ' ' . $body);
+    } elseif ($title !== '') {
+        $content = trim($title . ' ' . $content);
+    }
+
+    if ($content === '') {
+        return;
+    }
+
+    $html = AMAZONLINKS_buildContextualBlock($content, AMAZONLINKS_storyTopics($template));
+
+    if ($mode === 'template') {
+        if ($html !== '') {
+            $template->set_var('amazonlinks', $html);
+        }
+        return;
+    }
+
+    $displayType = (string) $template->get_var('story_display_type');
+
+    if (!AMAZONLINKS_isFullStoryDisplay($displayType) || $html === '') {
+        return;
+    }
+
+    /*
+     * Geeklog versions exposing story_display_type have a deterministic full
+     * article signal. Direct injection is preferred and the old 1.0 template
+     * placeholder is cleared to prevent duplicates in historical themes.
+     */
+    if (trim($displayType) !== '') {
+        AMAZONLINKS_injectVisibleStoryContent($template, $html);
+        $template->set_var('amazonlinks', '');
+        return;
+    }
+
+    /*
+     * Geeklog 2.1.1 does not expose story_display_type. Its historical normal
+     * and featured story paths behave differently with old Denim-derived
+     * themes. Tests on real 2.1.1 sites show that featuredstorytext renders a
+     * direct story-content injection, while storytext reliably renders the
+     * legacy {amazonlinks} placeholder instead. Handle those two paths
+     * explicitly and ignore the later article/body hooks to avoid duplicates.
+     */
+    if (in_array($templatename, array(
+        'article',
+        'featuredarticle',
+        'archivearticle',
+        'storybodytext',
+        'featuredstorybodytext',
+        'archivestorybodytext'
+    ), true)) {
+        return;
+    }
+
+    if ($templatename === 'featuredstorytext') {
+        AMAZONLINKS_injectVisibleStoryContent($template, $html);
+        $template->set_var('amazonlinks', '');
+        return;
+    }
+
+    /* Normal and archive 2.1.1 paths: use the established 1.0 placeholder. */
     $template->set_var('amazonlinks', $html);
 }
 
-/**
- * Plugin initialization hook
- */
-function plugin_init_amazonlinks()
+function plugin_getheadercode_amazonlinks()
+{
+    global $_CONF, $_AMAZONLINKS_CONF;
+
+    if (empty($_AMAZONLINKS_CONF['enabled']) || empty($_AMAZONLINKS_CONF['load_css'])) {
+        return '';
+    }
+
+    $href = $_CONF['site_url'] . '/amazonlinks/css/amazonlinks.css';
+
+    return '<link rel="stylesheet" href="'
+        . htmlspecialchars($href, ENT_QUOTES, 'UTF-8')
+        . '">' . LB;
+}
+
+function plugin_getadminoption_amazonlinks()
+{
+    global $_CONF, $LANG_AMAZONLINKS;
+
+    if (!SEC_hasRights('amazonlinks.admin')) {
+        return array();
+    }
+
+    return array(
+        $LANG_AMAZONLINKS['plugin_name'],
+        $_CONF['site_admin_url'] . '/plugins/amazonlinks/index.php',
+        ''
+    );
+}
+
+function plugin_cclabel_amazonlinks()
+{
+    global $_CONF, $LANG_AMAZONLINKS;
+
+    if (!SEC_hasRights('amazonlinks.admin')) {
+        return false;
+    }
+
+    return array(
+        $LANG_AMAZONLINKS['plugin_name'],
+        $_CONF['site_admin_url'] . '/plugins/amazonlinks/index.php',
+        ''
+    );
+}
+
+function plugin_chkVersion_amazonlinks()
 {
     global $_CONF;
+
+    require_once $_CONF['path'] . 'plugins/amazonlinks/autoinstall.php';
+    $params = plugin_autoinstall_amazonlinks('amazonlinks');
+
+    return $params['info']['pi_version'];
+}
+
+function plugin_upgrade_amazonlinks()
+{
+    global $_CONF, $_TABLES;
+
+    require_once $_CONF['path'] . 'plugins/amazonlinks/autoinstall.php';
+    require_once $_CONF['path'] . 'plugins/amazonlinks/install_defaults.php';
+
+    if (!plugin_compatible_with_this_version_amazonlinks('amazonlinks')) {
+        return 3002;
+    }
+
+    if (!plugin_initconfig_amazonlinks()) {
+        return false;
+    }
+
+    $c = config::get_instance();
+
+    if (DB_count($_TABLES['conf_values'], array('name', 'group_name'), array('display_mode', 'amazonlinks')) == 0) {
+        $c->add('display_mode', 'automatic', 'select', 0, 0, 3, 60, true, 'amazonlinks', 0);
+    }
+
+    if (DB_count($_TABLES['conf_values'], array('name', 'group_name'), array('button_color', 'amazonlinks')) == 0) {
+        $c->add('button_color', 'theme', 'select', 0, 0, 4, 70, true, 'amazonlinks', 0);
+    }
+
+    if (DB_count($_TABLES['conf_values'], array('name', 'group_name'), array('autotag_css', 'amazonlinks')) == 0) {
+        $c->add('autotag_css', 1, 'select', 0, 0, 1, 100, true, 'amazonlinks', 0);
+    }
+
+    if (!AMAZONLINKS_installConfigPermission()) {
+        return false;
+    }
+
+    if (!AMAZONLINKS_ensureDataDir()) {
+        return false;
+    }
+
+    if (!file_exists(AMAZONLINKS_rulesFile())) {
+        $defaultRules = $_CONF['path'] . 'plugins/amazonlinks/defaults/rules.json';
+        if (file_exists($defaultRules)) {
+            $json = file_get_contents($defaultRules);
+            if ($json === false || !AMAZONLINKS_writeJsonAtomically(AMAZONLINKS_rulesFile(), $json)) {
+                return false;
+            }
+        }
+    }
+
+    DB_query(
+        "UPDATE {$_TABLES['plugins']} "
+        . "SET pi_version = '1.1.0', pi_gl_version = '2.1.1' "
+        . "WHERE pi_name = 'amazonlinks'"
+    );
+
+    AMAZONLINKS_clearArticleCache();
+
     return true;
 }
 
-/**
- * Automatic uninstall function for AmazonLinks
- *
- * @return array
- */
 function plugin_autouninstall_amazonlinks()
 {
-    $out = array(
-        // No database tables to remove
-        'tables'      => array(),
-
-        // Groups created during installation
-        'groups'      => array('Amazon Links Admin'),
-
-        // Associated features
-        'features'    => array('amazonlinks.admin'),
-
-        // No PHP blocks
-        'php_blocks'  => array(),
-
-        // No specific variables
-        'vars'        => array()
+    return array(
+        'tables'     => array(),
+        'groups'     => array('Amazon Links Admin'),
+        'features'   => array('amazonlinks.admin', 'config.amazonlinks.tab_main'),
+        'php_blocks' => array(),
+        'vars'       => array()
     );
-
-    return $out;
 }
 
-?>
+function AMAZONLINKS_parseAutotagPayload($autotag)
+{
+    $payload = '';
+
+    if (isset($autotag['tagstr'])) {
+        $tagstr = trim((string) $autotag['tagstr']);
+        $prefix = '[amazonlinks:';
+        if (stripos($tagstr, $prefix) === 0 && substr($tagstr, -1) === ']') {
+            $payload = substr($tagstr, strlen($prefix), -1);
+        }
+    }
+
+    if ($payload === '') {
+        $parm1 = isset($autotag['parm1']) ? trim((string) $autotag['parm1']) : '';
+        $parm2 = isset($autotag['parm2']) ? trim((string) $autotag['parm2']) : '';
+        $payload = $parm1;
+        if ($parm2 !== '') {
+            $payload .= '|' . $parm2;
+        }
+    }
+
+    $target = trim($payload);
+    $label = '';
+
+    if (strpos($payload, '|') !== false) {
+        list($target, $label) = explode('|', $payload, 2);
+        $target = trim($target);
+        $label = trim($label);
+    }
+
+    return array($target, $label);
+}
+
+function plugin_autotags_amazonlinks($op, $content = '', $autotag = array())
+{
+    global $LANG_AMAZONLINKS, $_AMAZONLINKS_CONF;
+
+    if ($op === 'tagname') {
+        return 'amazonlinks';
+    }
+    if ($op === 'description') {
+        return array('amazonlinks' => $LANG_AMAZONLINKS['autotag_description']);
+    }
+    if ($op === 'permission' || $op === 'nopermission') {
+        return ($op === 'permission') ? array('amazonlinks') : array();
+    }
+    if ($op === 'closetag') {
+        return array();
+    }
+    if ($op !== 'parse') {
+        return $content;
+    }
+
+    list($target, $label) = AMAZONLINKS_parseAutotagPayload($autotag);
+
+    if ($target === '') {
+        return $content;
+    }
+
+    $url = '';
+
+    if (stripos($target, 'asin:') === 0) {
+        $asin = substr($target, 5);
+        $url = AMAZONLINKS_buildAsinUrl($asin);
+        if ($label === '') {
+            $label = 'Amazon';
+        }
+    } else {
+        $url = AMAZONLINKS_buildSearchUrl($target);
+        if ($label === '') {
+            $label = $target;
+        }
+    }
+
+    if ($url === '') {
+        return $content;
+    }
+
+    $className = !empty($_AMAZONLINKS_CONF['autotag_css']) ? 'amazonlinks-autotag' : '';
+    $link = AMAZONLINKS_renderLink($label, $url, $className);
+    return str_replace($autotag['tagstr'], $link, $content);
+}
