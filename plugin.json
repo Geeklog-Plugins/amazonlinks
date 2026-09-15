@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "id": "amazonlinks",
+  "name": "amazonlinks",
+  "requires": {
+    "geeklog": "2.1.1"
+  }
+}
