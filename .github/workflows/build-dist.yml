@@ -25,16 +25,16 @@ jobs:
         id: metadata
         shell: bash
         run: |
-          VERSION="$(sed -n 's:.*<pi_version>\(.*\)</pi_version>.*:\1:p' plugin.xml | head -n 1)"
-          GL_VERSION="$(sed -n 's:.*<pi_gl_version>\(.*\)</pi_gl_version>.*:\1:p' plugin.xml | head -n 1)"
+          VERSION="$(php -r '$p = include "autoinstall.php"; if (function_exists("plugin_autoinstall_amazonlinks")) { $i = plugin_autoinstall_amazonlinks("amazonlinks"); echo isset($i["info"]["pi_version"]) ? $i["info"]["pi_version"] : ""; }' 2>/dev/null)"
+          GL_VERSION="$(php -r '$p = include "autoinstall.php"; if (function_exists("plugin_autoinstall_amazonlinks")) { $i = plugin_autoinstall_amazonlinks("amazonlinks"); echo isset($i["info"]["pi_gl_version"]) ? $i["info"]["pi_gl_version"] : ""; }' 2>/dev/null)"
 
           if [ -z "$VERSION" ]; then
-            echo "Unable to read pi_version from plugin.xml" >&2
+            echo "Unable to read pi_version from autoinstall.php" >&2
             exit 1
           fi
 
           if [ -z "$GL_VERSION" ]; then
-            echo "Unable to read pi_gl_version from plugin.xml" >&2
+            echo "Unable to read pi_gl_version from autoinstall.php" >&2
             exit 1
           fi
 
@@ -44,6 +44,17 @@ jobs:
           echo "gl_version=$GL_VERSION" >> "$GITHUB_OUTPUT"
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
           echo "Building AmazonLinks $VERSION for Geeklog $GL_VERSION"
+
+      - name: Validate plugin manifest
+        shell: bash
+        run: |
+          php -r '
+          $m = json_decode(file_get_contents("plugin.json"), true);
+          if (!is_array($m) || (int)($m["schema"] ?? 0) !== 1 || ($m["id"] ?? "") !== "amazonlinks") {
+              fwrite(STDERR, "Invalid plugin.json\n");
+              exit(1);
+          }
+          '
 
       - name: Validate PHP syntax
         shell: bash
